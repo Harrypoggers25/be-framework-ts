@@ -1,0 +1,19 @@
+{
+  "name": "test-cjs",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "b": "tsc",
+    "r": "node dist/app.js",
+    "br": "tsc && node dist/app.js",
+    "tbr": "tsc && node dist/test/test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

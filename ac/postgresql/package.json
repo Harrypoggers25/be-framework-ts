@@ -1,0 +1,39 @@
+{
+  "name": "@harrypoggers/ac-postgresql",
+  "version": "1.0.0",
+  "description": "Access control postgresql utility for express js projects",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "dev": "tsup src/index.ts --format esm,cjs --dts --watch",
+    "link": "tsup src/index.ts --format esm,cjs --dts --clean && npm link",
+    "pre": "npm pack --dry-run"
+  },
+  "files": [
+    "dist"
+  ],
+  "author": "harrypoggers",
+  "license": "ISC",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@harrypoggers/db-postgresql": "^1.0.0",
+    "@harrypoggers/route": "^1.0.2",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.3"
+  }
+}

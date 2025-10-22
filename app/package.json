@@ -1,0 +1,41 @@
+{
+  "name": "@harrypoggers/app",
+  "version": "1.0.3",
+  "description": "App utility for express js projects",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "dev": "tsup src/index.ts --format esm,cjs --dts --watch",
+    "link": "tsup src/index.ts --format esm,cjs --dts --clean && npm link",
+    "pre": "npm pack --dry-run"
+  },
+  "files": [
+    "dist"
+  ],
+  "author": "harrypoggers",
+  "license": "ISC",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@harrypoggers/color": "^1.0.6",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "http": "^0.0.1-security"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.3"
+  }
+}

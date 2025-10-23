@@ -5,18 +5,6 @@ import pg, { PoolConfig } from 'pg';
 import ch from '@harrypoggers/color';
 
 namespace Pool {
-    let pool: pg.Pool | null = null;
-
-    export function setPool(config: PoolConfig): void {
-        pool = new pg.Pool(config);
-    }
-
-    export function getPool(): pg.Pool {
-        if (!pool) throw new Error('Failed to retrieve pool. Pool is not initialized');
-
-        return pool;
-    }
-
     type DbErrorResult = {
         code: string;
         message: string;
@@ -33,36 +21,68 @@ namespace Pool {
         showQuery?: boolean,
         transaction?: Transaction | null,
     };
-    export async function query(query: string, options?: DbQueryOptions): Promise<DbResult> {
-        options = {
-            values: options?.values ?? [],
-            showError: options?.showError ?? true,
-            showQuery: options?.showQuery ?? false,
-            transaction: options?.transaction ?? null,
-        }
+
+    async function queryHandler(
+        query: string,
+        values: Array<number | string | Date>,
+        showError: boolean,
+        tryHandler: () => Promise<pg.QueryResult<any>>,
+        errorHandler?: (error: any) => Promise<void>
+    ) {
+        errorHandler = errorHandler ?? (async () => { });
 
         try {
-            if (options.transaction && !options.transaction.conn) {
-                options.transaction.conn = await getPool().connect();
-                options.transaction.conn.query('BEGIN;');
-            }
-            const conn = options.transaction ? options.transaction.conn! : getPool();
-
-            if (options.showQuery) console.log({ query: query, values: options.values });
-            return await conn.query(query, options.values);
-
+            return await tryHandler();
         } catch (error: any) {
-            if (options.transaction && options.transaction.rollbackOnError) await options.transaction.rollback();
+            await errorHandler?.(error)!;
 
             const result: DbErrorResult = {
                 code: error.code ?? 'ER_INTERNAL_ERROR',
                 message: error.sqlMessage ?? error,
                 query,
-                values: options.values!
+                values
             };
 
-            if (options.showError) console.log(ch.red('DB QUERY ERROR:'), result);
+            if (showError) console.log(ch.red('DB QUERY ERROR:'), result);
             return result;
+        }
+    }
+
+    export class Pool {
+        private pool: pg.Pool;
+
+        constructor(config: PoolConfig) {
+            this.pool = new pg.Pool(config);
+        }
+        async query(query: string, options?: DbQueryOptions): Promise<DbResult> {
+            options = {
+                values: options?.values ?? [],
+                showError: options?.showError ?? true,
+                showQuery: options?.showQuery ?? false,
+                transaction: options?.transaction ?? null,
+            }
+
+            return queryHandler(
+                query,
+                options.values!,
+                options.showError!,
+                async () => {
+                    const transaction = options.transaction;
+                    if (!transaction?.conn) await transaction?.begin(await this.pool.connect());
+                    const conn = transaction ? transaction.conn! : this.pool;
+
+                    if (options.showQuery) console.log({ query: query, values: options.values });
+                    return await conn.query(query, options.values);
+                },
+                async (error) => {
+                    if (options.transaction && options.transaction.rollbackOnError) await options.transaction.rollback();
+                }
+            );
+        }
+        async transaction(options?: TransactionOptions): Promise<Transaction> {
+            const transaction = new Transaction(options);
+            await transaction.begin(await this.pool.connect());
+            return transaction;
         }
     }
 
@@ -75,11 +95,14 @@ namespace Pool {
         return count < 2;
     }
 
+    export interface TransactionOptions {
+        rollbackOnError?: boolean
+    }
     export class Transaction {
         public conn: pg.PoolClient | null;
         public rollbackOnError: boolean;
 
-        constructor(options?: { rollbackOnError?: boolean }) {
+        constructor(options?: TransactionOptions) {
             options = {
                 rollbackOnError: options?.rollbackOnError ?? false
             };
@@ -87,17 +110,47 @@ namespace Pool {
             this.conn = null;
             this.rollbackOnError = options.rollbackOnError!;
         }
-        public async commit() {
+        public async begin(conn: pg.PoolClient, showError?: boolean) {
+            showError = showError ?? true;
             if (this.conn) {
-                await query('COMMIT;', { transaction: this });
-                this.end();
+                console.log(ch.red('DB TRANSACTION ERROR:'), 'Failed to begin transaction. Connection already established');
+                return;
             }
+
+            this.conn = conn;
+            const query = 'COMMIT;';
+            await queryHandler(query, [], showError, async () => {
+                return this.conn!.query(query);
+            });
+            this.end();
         }
-        public async rollback() {
-            if (this.conn) {
-                await query('ROLLBACK', { transaction: this });
-                this.end();
+        public async commit(showError?: boolean) {
+            showError = showError ?? true;
+
+            if (!this.conn) {
+                console.log(ch.red('DB TRANSACTION ERROR:'), 'Failed to commit transaction. Connection is not established');
+                return;
             }
+
+            const query = 'COMMIT;';
+            await queryHandler(query, [], showError, async () => {
+                return this.conn!.query(query);
+            });
+            this.end();
+        }
+        public async rollback(showError?: boolean) {
+            showError = showError ?? true;
+
+            if (!this.conn) {
+                console.log(ch.red('DB TRANSACTION ERROR:'), 'Failed to commit transaction. Connection is not established');
+                return;
+            }
+
+            const query = 'ROLLBACK';
+            await queryHandler(query, [], showError, async () => {
+                return this.conn!.query(query);
+            });
+            this.end();
         }
         private async end() {
             if (this.conn) {
@@ -141,9 +194,6 @@ class Placeholder {
 }
 
 namespace Db {
-    export const setPool = Pool.setPool;
-    export const getPool = Pool.getPool;
-
     export const DataTypes = {
         SMALLINT: 'SMALLINT',
         INTEGER: 'INTEGER',
@@ -219,7 +269,7 @@ namespace Db {
     interface DefinitionOptions { schema?: string, showQuery?: boolean }
     interface ModelOptions<T extends Record<string, ColumnOptions<any>>> {
         where?: ModelBody<T>;
-        transaction?: Transaction | null;
+        transaction?: Pool.Transaction | null;
     }
     interface SetForeignKeyOptions<T extends Record<string, ColumnOptions<any>>> {
         constraintName?: string;
@@ -271,246 +321,248 @@ namespace Db {
         }
     }
 
-    export function define<T extends Record<string, ColumnOptions<any>>>(
-        tableName: string,
-        definitionBody: T,
-        options?: DefinitionOptions
-    ): Model<T> {
-        const schema = options?.schema ?? 'public';
-        const showQuery = options?.showQuery ?? false;
-        script.setSchema(schema);
-
-        let pkColumn: string | null = null;
-
-        // Create table query
-        const subquery: Array<string> = [];
-        const columns: Array<string> = [];
-
-        for (const [key, val] of Object.entries(definitionBody)) {
-            val.allowNull = val.allowNull ?? false;
-            val.primaryKey = val.primaryKey ?? false;
-            val.unique = val.unique ?? false;
-
-            if (val.primaryKey) pkColumn = key;
-            let query = `${key} ${val.type}`;
-            if (!val.primaryKey) query += val.allowNull ? '' : ' NOT NULL';
-            query += val.primaryKey ? ' PRIMARY KEY' : '';
-            if (!val.primaryKey) query += val.unique ? ' UNIQUE' : '';
-
-            if (val.defaultValue !== undefined && val.defaultValue !== '') {
-                query += ' DEFAULT';
-                if (typeof val.defaultValue === 'boolean') query += val.defaultValue ? ' TRUE' : ' FALSE';
-                else if (typeof val.defaultValue === 'string') query += ` '${val.defaultValue}'`;
-                else query += ` ${val.defaultValue}`;
-            }
-            columns.push(key);
-            subquery.push(query);
-        }
-
-        script.push('drop', `DROP TABLE IF EXISTS ${schema}.${tableName};`);
-        script.push('create', `CREATE TABLE IF NOT EXISTS ${schema}.${tableName} (${subquery.join(', ')});`);
-        syncScripts.push(`SELECT ${columns.join(', ')} FROM ${schema}.${tableName};`);
-
-        return {
-            tableName,
-            schema,
-            pkColumn,
-            async create(body: ModelBody<T>, options?: ModelOptions<T>): Promise<DataValues<T> | null> {
-                return await modelHandler(async () => {
-                    const keys = Object.keys(body);
-                    const values = Object.values(body);
-                    const placeholder = new Placeholder();
-                    const transaction = options?.transaction;
-                    const query =
-                        `INSERT INTO ${schema}.${tableName} (${keys.join(', ')}) ` +
-                        `VALUES (${placeholder.generate(values.length)}) RETURNING *;`;
-
-                    const response = await Pool.query(query, { values, showQuery, transaction });
-                    if (!Pool.isSuccess(response)) throw new Error(`Failed to create data. ${response.message}`);
-
-                    return response.rows[0] as DataValues<T>;
-                });
-            },
-            async find(options?: ModelOptions<T>): Promise<Array<DataValues<T>> | null> {
-                return await modelHandler(async () => {
-                    const placeholder = new Placeholder();
-                    const where = options?.where ? ` WHERE ${placeholder.generate(options.where, ' AND ')}` : '';
-                    const query = `SELECT * FROM ${schema}.${tableName}${where};`;
-                    const transaction = options?.transaction;
-                    const values = placeholder.values([options?.where]);
-
-                    const response = await Pool.query(query, { values, showQuery, transaction });
-                    if (!Pool.isSuccess(response)) throw new Error(`Failed to find data. ${response.message}`);
-
-                    return response.rows as Array<DataValues<T>>;
-                });
-            },
-            async update(bodyToUpdate: ModelBody<T>, options?: ModelOptions<T>): Promise<Array<DataValues<T>> | null> {
-                return await modelHandler(async () => {
-                    const placeholder = new Placeholder();
-                    const set = `SET ${placeholder.generate(bodyToUpdate)}`;
-                    const where = options?.where ? ` WHERE ${placeholder.generate(options.where, ' AND ')}` : '';
-                    const query = `UPDATE ${schema}.${tableName} ${set}${where} RETURNING *;`;
-                    const transaction = options?.transaction;
-                    const values = placeholder.values([bodyToUpdate, options?.where]);
-
-                    const response = await Pool.query(query, { values, showQuery, transaction });
-                    if (!Pool.isSuccess(response)) throw new Error(`Failed to update data. ${response.message}`);
-
-                    return response.rows as Array<DataValues<T>>;
-                })
-            },
-            async delete(options?: ModelOptions<T>): Promise<Array<DataValues<T>> | null> {
-                return modelHandler(async () => {
-                    const placeholder = new Placeholder();
-                    const where = options?.where ? ` WHERE ${placeholder.generate(options.where, ' AND ')}` : '';
-                    const query = `DELETE FROM ${schema}.${tableName}${where} RETURNING *;`;
-                    const transaction = options?.transaction;
-                    const values = placeholder.values([options?.where]);
-
-                    const response = await Pool.query(query, { values, showQuery, transaction });
-                    if (!Pool.isSuccess(response)) throw new Error(`Failed to delete data. ${response.message}`);
-
-                    return response.rows as Array<DataValues<T>>;
-                });
-            },
-            async findByPk(pk: number | string, options?: ModelOptions<T>): Promise<DataValues<T> | null> {
-                return modelHandler(async () => {
-                    if (pkColumn === null) throw new Error(`Failed to find data by pk. Table ${tableName} does not have a primary key`);
-
-                    options = {
-                        where: options?.where ?? {},
-                        transaction: options?.transaction ?? null
-                    };
-                    (options.where as any)[pkColumn] = pk;
-
-                    const placeholder = new Placeholder();
-                    const where = ` WHERE ${placeholder.generate(options.where!, ' AND ')}`
-                    const query = `SELECT * FROM ${schema}.${tableName}${where};`;
-                    const transaction = options?.transaction;
-                    const values = placeholder.values([options.where]);
-
-                    const response = await Pool.query(query, { values, showQuery, transaction });
-                    if (!Pool.isSuccess(response)) throw new Error(`Failed to find data by pk (${pkColumn}=${typeof pk === 'string' ? `'${pk}'` : pk}). ${response.message}`);
-                    if (!response.rows.length) throw new Error(`Failed to find data by pk (${pkColumn}=${pk}). No data found`);
-
-                    return response.rows[0] as DataValues<T>;
-                });
-            },
-            async updateByPk(pk: number | string, bodyToUpdate: ModelBody<T>, options?: ModelOptions<T>): Promise<DataValues<T> | null> {
-                return modelHandler(async () => {
-                    if (pkColumn === null) throw new Error(`Failed to update data by pk. Table ${tableName} does not have a primary key`);
-
-                    options = {
-                        where: options?.where ?? {},
-                        transaction: options?.transaction ?? null
-                    };
-                    (options.where as any)[pkColumn] = pk;
-
-                    const placeholder = new Placeholder();
-                    const set = ` SET ${placeholder.generate(bodyToUpdate)}`;
-                    const where = ` WHERE ${placeholder.generate(options.where!, ' AND ')}`;
-                    const query = `UPDATE ${schema}.${tableName}${set}${where} RETURNING *;`;
-                    const transaction = options?.transaction;
-                    const values = placeholder.values([bodyToUpdate, options.where]);
-
-                    const response = await Pool.query(query, { values, showQuery, transaction });
-                    if (!Pool.isSuccess(response)) throw new Error(`Failed to update data by pk (${pkColumn}=${typeof pk === 'string' ? `'${pk}'` : pk}). ${response.message}`);
-                    if (!response.rows.length) throw new Error(`Failed to update data by pk (${pkColumn}=${pk}). No data found`);
-
-                    return response.rows[0] as DataValues<T>;
-                });
-            },
-            async deleteByPk(pk: number | string, options?: ModelOptions<T>): Promise<DataValues<T> | null> {
-                return modelHandler(async () => {
-                    if (pkColumn === null) throw new Error(`Failed to delete data by pk. Table ${tableName} does not have a primary key`);
-
-                    options = {
-                        where: options?.where ?? {},
-                        transaction: options?.transaction ?? null
-                    };
-                    (options.where as any)[pkColumn] = pk;
-
-                    const placeholder = new Placeholder();
-                    const where = ` WHERE ${placeholder.generate(options.where!, ' AND ')}`;
-                    const query = `DELETE FROM ${schema}.${tableName}${where} RETURNING *;`;
-                    const transaction = options?.transaction;
-                    const values = placeholder.values([options.where]);
-
-                    const response = await Pool.query(query, { values, showQuery, transaction });
-                    if (!Pool.isSuccess(response)) throw new Error(`Failed to delete data by pk (${pkColumn}=${typeof pk === 'string' ? `'${pk}'` : pk}). ${response.message}`);
-                    if (!response.rows.length) throw new Error(`Failed to delete data by pk (${pkColumn}=${pk}). No data found`);
-
-                    return response.rows[0] as DataValues<T>;
-                });
-            },
-            setForeignKey(model, foreignKey, options): void {
-                options = {
-                    constraintName: options?.constraintName ?? `${tableName}_${model.tableName}`,
-                    referenceKey: options?.referenceKey ?? foreignKey
-                }
-
-                script.push('drop_constraint',
-                    `ALTER TABLE IF EXISTS ${schema}.${tableName} ` +
-                    `DROP CONSTRAINT IF EXISTS fk_${options.constraintName};`
-                );
-
-                script.push('alter',
-                    `ALTER TABLE IF EXISTS ${schema}.${tableName} ` +
-                    `ADD CONSTRAINT fk_${options.constraintName} ` +
-                    `FOREIGN KEY (${foreignKey}) ` +
-                    `REFERENCES ${model.schema}.${model.tableName} (${options.referenceKey}) ` +
-                    'ON DELETE CASCADE ' +
-                    'ON UPDATE CASCADE;'
-                );
-            },
-        }
-    }
-
-    export class Transaction extends Pool.Transaction { }
-
     interface SyncOptions {
         alter?: boolean;
-        onSuccessAlter?: (transaction: Transaction) => Promise<void>
+        onSuccessAlter?: (transaction: Pool.Transaction) => Promise<void>
     }
 
-    export async function sync(options?: SyncOptions): Promise<void> {
-        options = {
-            alter: options?.alter ?? false,
-            onSuccessAlter: options?.onSuccessAlter ?? (async () => { })
-        }
+    export class Db {
+        public pool: Pool.Pool;
 
-        if (!options?.alter!) {
-            for (const query of syncScripts) {
-                await Pool.query(query)
+        constructor(config: PoolConfig) {
+            this.pool = new Pool.Pool(config);
+        }
+        define<T extends Record<string, ColumnOptions<any>>>(
+            tableName: string,
+            definitionBody: T,
+            options?: DefinitionOptions
+        ): Model<T> {
+            const schema = options?.schema ?? 'public';
+            const showQuery = options?.showQuery ?? false;
+            script.setSchema(schema);
+
+            let pkColumn: string | null = null;
+
+            // Create table query
+            const subquery: Array<string> = [];
+            const columns: Array<string> = [];
+
+            for (const [key, val] of Object.entries(definitionBody)) {
+                val.allowNull = val.allowNull ?? false;
+                val.primaryKey = val.primaryKey ?? false;
+                val.unique = val.unique ?? false;
+
+                if (val.primaryKey) pkColumn = key;
+                let query = `${key} ${val.type}`;
+                if (!val.primaryKey) query += val.allowNull ? '' : ' NOT NULL';
+                query += val.primaryKey ? ' PRIMARY KEY' : '';
+                if (!val.primaryKey) query += val.unique ? ' UNIQUE' : '';
+
+                if (val.defaultValue !== undefined && val.defaultValue !== '') {
+                    query += ' DEFAULT';
+                    if (typeof val.defaultValue === 'boolean') query += val.defaultValue ? ' TRUE' : ' FALSE';
+                    else if (typeof val.defaultValue === 'string') query += ` '${val.defaultValue}'`;
+                    else query += ` ${val.defaultValue}`;
+                }
+                columns.push(key);
+                subquery.push(query);
             }
 
-            return;
-        }
+            script.push('drop', `DROP TABLE IF EXISTS ${schema}.${tableName};`);
+            script.push('create', `CREATE TABLE IF NOT EXISTS ${schema}.${tableName} (${subquery.join(', ')});`);
+            syncScripts.push(`SELECT ${columns.join(', ')} FROM ${schema}.${tableName};`);
 
-        const transaction = new Transaction({ rollbackOnError: true });
-        const folder = script.getFolder();
-        const sequence: Array<QueryType> = ['drop_constraint', 'drop', 'schema', 'create', 'alter'];
-        for (const key of sequence) {
-            for (const type of Object.values(folder[key as QueryType])) {
-                for (const query of type) {
-                    const response = await Pool.query(query, { transaction });
-                    if (!response) return;
+            const pool = this.pool;
+            return {
+                tableName,
+                schema,
+                pkColumn,
+                async create(body: ModelBody<T>, options?: ModelOptions<T>): Promise<DataValues<T> | null> {
+                    return await modelHandler(async () => {
+                        const keys = Object.keys(body);
+                        const values = Object.values(body);
+                        const placeholder = new Placeholder();
+                        const transaction = options?.transaction;
+                        const query =
+                            `INSERT INTO ${schema}.${tableName} (${keys.join(', ')}) ` +
+                            `VALUES (${placeholder.generate(values.length)}) RETURNING *;`;
+
+                        const response = await pool.query(query, { values, showQuery, transaction });
+                        if (!Pool.isSuccess(response)) throw new Error(`Failed to create data. ${response.message}`);
+
+                        return response.rows[0] as DataValues<T>;
+                    });
+                },
+                async find(options?: ModelOptions<T>): Promise<Array<DataValues<T>> | null> {
+                    return await modelHandler(async () => {
+                        const placeholder = new Placeholder();
+                        const where = options?.where ? ` WHERE ${placeholder.generate(options.where, ' AND ')}` : '';
+                        const query = `SELECT * FROM ${schema}.${tableName}${where};`;
+                        const transaction = options?.transaction;
+                        const values = placeholder.values([options?.where]);
+
+                        const response = await pool.query(query, { values, showQuery, transaction });
+                        if (!Pool.isSuccess(response)) throw new Error(`Failed to find data. ${response.message}`);
+
+                        return response.rows as Array<DataValues<T>>;
+                    });
+                },
+                async update(bodyToUpdate: ModelBody<T>, options?: ModelOptions<T>): Promise<Array<DataValues<T>> | null> {
+                    return await modelHandler(async () => {
+                        const placeholder = new Placeholder();
+                        const set = `SET ${placeholder.generate(bodyToUpdate)}`;
+                        const where = options?.where ? ` WHERE ${placeholder.generate(options.where, ' AND ')}` : '';
+                        const query = `UPDATE ${schema}.${tableName} ${set}${where} RETURNING *;`;
+                        const transaction = options?.transaction;
+                        const values = placeholder.values([bodyToUpdate, options?.where]);
+
+                        const response = await pool.query(query, { values, showQuery, transaction });
+                        if (!Pool.isSuccess(response)) throw new Error(`Failed to update data. ${response.message}`);
+
+                        return response.rows as Array<DataValues<T>>;
+                    })
+                },
+                async delete(options?: ModelOptions<T>): Promise<Array<DataValues<T>> | null> {
+                    return modelHandler(async () => {
+                        const placeholder = new Placeholder();
+                        const where = options?.where ? ` WHERE ${placeholder.generate(options.where, ' AND ')}` : '';
+                        const query = `DELETE FROM ${schema}.${tableName}${where} RETURNING *;`;
+                        const transaction = options?.transaction;
+                        const values = placeholder.values([options?.where]);
+
+                        const response = await pool.query(query, { values, showQuery, transaction });
+                        if (!Pool.isSuccess(response)) throw new Error(`Failed to delete data. ${response.message}`);
+
+                        return response.rows as Array<DataValues<T>>;
+                    });
+                },
+                async findByPk(pk: number | string, options?: ModelOptions<T>): Promise<DataValues<T> | null> {
+                    return modelHandler(async () => {
+                        if (pkColumn === null) throw new Error(`Failed to find data by pk. Table ${tableName} does not have a primary key`);
+
+                        options = {
+                            where: options?.where ?? {},
+                            transaction: options?.transaction ?? null
+                        };
+                        (options.where as any)[pkColumn] = pk;
+
+                        const placeholder = new Placeholder();
+                        const where = ` WHERE ${placeholder.generate(options.where!, ' AND ')}`
+                        const query = `SELECT * FROM ${schema}.${tableName}${where};`;
+                        const transaction = options?.transaction;
+                        const values = placeholder.values([options.where]);
+
+                        const response = await pool.query(query, { values, showQuery, transaction });
+                        if (!Pool.isSuccess(response)) throw new Error(`Failed to find data by pk (${pkColumn}=${typeof pk === 'string' ? `'${pk}'` : pk}). ${response.message}`);
+                        if (!response.rows.length) throw new Error(`Failed to find data by pk (${pkColumn}=${pk}). No data found`);
+
+                        return response.rows[0] as DataValues<T>;
+                    });
+                },
+                async updateByPk(pk: number | string, bodyToUpdate: ModelBody<T>, options?: ModelOptions<T>): Promise<DataValues<T> | null> {
+                    return modelHandler(async () => {
+                        if (pkColumn === null) throw new Error(`Failed to update data by pk. Table ${tableName} does not have a primary key`);
+
+                        options = {
+                            where: options?.where ?? {},
+                            transaction: options?.transaction ?? null
+                        };
+                        (options.where as any)[pkColumn] = pk;
+
+                        const placeholder = new Placeholder();
+                        const set = ` SET ${placeholder.generate(bodyToUpdate)}`;
+                        const where = ` WHERE ${placeholder.generate(options.where!, ' AND ')}`;
+                        const query = `UPDATE ${schema}.${tableName}${set}${where} RETURNING *;`;
+                        const transaction = options?.transaction;
+                        const values = placeholder.values([bodyToUpdate, options.where]);
+
+                        const response = await pool.query(query, { values, showQuery, transaction });
+                        if (!Pool.isSuccess(response)) throw new Error(`Failed to update data by pk (${pkColumn}=${typeof pk === 'string' ? `'${pk}'` : pk}). ${response.message}`);
+                        if (!response.rows.length) throw new Error(`Failed to update data by pk (${pkColumn}=${pk}). No data found`);
+
+                        return response.rows[0] as DataValues<T>;
+                    });
+                },
+                async deleteByPk(pk: number | string, options?: ModelOptions<T>): Promise<DataValues<T> | null> {
+                    return modelHandler(async () => {
+                        if (pkColumn === null) throw new Error(`Failed to delete data by pk. Table ${tableName} does not have a primary key`);
+
+                        options = {
+                            where: options?.where ?? {},
+                            transaction: options?.transaction ?? null
+                        };
+                        (options.where as any)[pkColumn] = pk;
+
+                        const placeholder = new Placeholder();
+                        const where = ` WHERE ${placeholder.generate(options.where!, ' AND ')}`;
+                        const query = `DELETE FROM ${schema}.${tableName}${where} RETURNING *;`;
+                        const transaction = options?.transaction;
+                        const values = placeholder.values([options.where]);
+
+                        const response = await pool.query(query, { values, showQuery, transaction });
+                        if (!Pool.isSuccess(response)) throw new Error(`Failed to delete data by pk (${pkColumn}=${typeof pk === 'string' ? `'${pk}'` : pk}). ${response.message}`);
+                        if (!response.rows.length) throw new Error(`Failed to delete data by pk (${pkColumn}=${pk}). No data found`);
+
+                        return response.rows[0] as DataValues<T>;
+                    });
+                },
+                setForeignKey(model, foreignKey, options): void {
+                    options = {
+                        constraintName: options?.constraintName ?? `${tableName}_${model.tableName}`,
+                        referenceKey: options?.referenceKey ?? foreignKey
+                    }
+
+                    script.push('drop_constraint',
+                        `ALTER TABLE IF EXISTS ${schema}.${tableName} ` +
+                        `DROP CONSTRAINT IF EXISTS fk_${options.constraintName};`
+                    );
+
+                    script.push('alter',
+                        `ALTER TABLE IF EXISTS ${schema}.${tableName} ` +
+                        `ADD CONSTRAINT fk_${options.constraintName} ` +
+                        `FOREIGN KEY (${foreignKey}) ` +
+                        `REFERENCES ${model.schema}.${model.tableName} (${options.referenceKey}) ` +
+                        'ON DELETE CASCADE ' +
+                        'ON UPDATE CASCADE;'
+                    );
+                },
+            }
+        }
+        async transaction(options?: Pool.TransactionOptions): Promise<Pool.Transaction> {
+            return await this.pool.transaction(options);
+        }
+        async sync(options?: SyncOptions): Promise<void> {
+            options = {
+                alter: options?.alter ?? false,
+                onSuccessAlter: options?.onSuccessAlter ?? (async () => { })
+            }
+
+            if (!options?.alter!) {
+                for (const query of syncScripts) {
+                    await this.pool.query(query)
+                }
+
+                return;
+            }
+
+            const transaction = await this.pool.transaction({ rollbackOnError: true });
+            const folder = script.getFolder();
+            const sequence: Array<QueryType> = ['drop_constraint', 'drop', 'schema', 'create', 'alter'];
+            for (const key of sequence) {
+                for (const type of Object.values(folder[key as QueryType])) {
+                    for (const query of type) {
+                        const response = await this.pool.query(query, { transaction });
+                        if (!Pool.isSuccess(response)) return;
+                    }
                 }
             }
+            await options.onSuccessAlter?.(transaction);
+            await transaction.commit();
         }
-        if (transaction.conn) await options.onSuccessAlter?.(transaction);
-        await transaction.commit();
     }
 }
 
-const DataTypes = Db.DataTypes;
-class Transaction extends Pool.Transaction { };
-
+export const DataTypes = Db.DataTypes;
 export default Db;
-export {
-    DataTypes,
-    Pool,
-    Transaction
-};
+export { Pool };
 

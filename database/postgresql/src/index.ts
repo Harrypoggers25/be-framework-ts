@@ -122,7 +122,6 @@ namespace Pool {
             await queryHandler(query, [], showError, async () => {
                 return this.conn!.query(query);
             });
-            this.end();
         }
         public async commit(showError?: boolean) {
             showError = showError ?? true;
@@ -545,7 +544,7 @@ namespace Db {
                 return;
             }
 
-            const transaction = await this.pool.transaction({ rollbackOnError: true });
+            const transaction = await this.transaction({ rollbackOnError: true });
             const folder = script.getFolder();
             const sequence: Array<QueryType> = ['drop_constraint', 'drop', 'schema', 'create', 'alter'];
             for (const key of sequence) {

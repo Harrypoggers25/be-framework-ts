@@ -27,7 +27,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@harrypoggers/db-postgresql": "^1.0.0",
+    "@harrypoggers/db-postgresql": "^1.0.1",
     "@harrypoggers/route": "^1.0.2",
     "express": "^4.21.2"
   },

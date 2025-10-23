@@ -2,7 +2,7 @@
 import express from 'express';
 
 // HELPERS
-import Db, { DataTypes, Transaction } from '@harrypoggers/db-postgresql';
+import Db, { DataTypes, Pool } from '@harrypoggers/db-postgresql';
 import Route from '@harrypoggers/route';
 
 type ERequest = express.Request & { user?: any };
@@ -13,24 +13,25 @@ type EMiddleware = (req: ERequest, res: EResponse, next: ENextFunction) => void;
 namespace AccessControl {
     interface RoleBaseOptions {
         tableName?: string;
-        setRolesHandler?: (transaction?: Transaction) => Promise<Array<string>>;
+        setRolesHandler?: (transaction?: Pool.Transaction) => Promise<Array<string>>;
         setRoutesHandler?: (app: express.Express) => Promise<Array<string>>;
         ignoreRoutes?: Array<string>;
     };
     interface RoleBaseSyncOptions {
         alter?: boolean;
-        setRolesHandler?: (transaction?: Transaction) => Promise<Array<string>>;
+        setRolesHandler?: (transaction?: Pool.Transaction) => Promise<Array<string>>;
         setRoutesHandler?: (app: express.Express) => Promise<Array<string>>;
-        transaction?: Db.Transaction;
+        transaction?: Pool.Transaction;
     };
     export class RoleBase {
         private mappedRole: (req: ERequest) => string;
-        private setRolesHandler: (transaction?: Transaction) => Promise<Array<string>>;
+        private setRolesHandler: (transaction?: Pool.Transaction) => Promise<Array<string>>;
         private setRoutesHandler: (app: express.Express) => Promise<Array<string>>;
         private ignoreRoutes: Array<string>;
+        private db: Db.Db;
         private model;
 
-        constructor(roleFromReq: (req: ERequest) => string, options?: RoleBaseOptions) {
+        constructor(db: Db.Db, roleFromReq: (req: ERequest) => string, options?: RoleBaseOptions) {
             options = {
                 tableName: options?.tableName ?? 'rbac_table',
                 setRolesHandler: options?.setRolesHandler ?? (async () => []),
@@ -38,14 +39,15 @@ namespace AccessControl {
                 ignoreRoutes: options?.ignoreRoutes ?? []
             }
 
-            this.ignoreRoutes = options.ignoreRoutes!;
+            this.mappedRole = roleFromReq;
             this.setRolesHandler = options.setRolesHandler!;
             this.setRoutesHandler = options.setRoutesHandler!;
-            this.mappedRole = roleFromReq;
+            this.ignoreRoutes = options.ignoreRoutes!;
+            this.db = db;
 
             const tableName = options.tableName!;
 
-            this.model = Db.define(tableName, {
+            this.model = db.define(tableName, {
                 rbac_id: { type: DataTypes.SERIAL, allowNull: false, primaryKey: true },
                 role_name: { type: DataTypes.TEXT, allowNull: false },
                 route: { type: DataTypes.TEXT, allowNull: false },
@@ -61,7 +63,7 @@ namespace AccessControl {
                 alter: options?.alter ?? false,
                 setRolesHandler: options?.setRolesHandler ?? this.setRolesHandler,
                 setRoutesHandler: options?.setRoutesHandler ?? this.setRoutesHandler,
-                transaction: options?.transaction ?? new Db.Transaction({ rollbackOnError: true })
+                transaction: options?.transaction ?? await this.db.transaction({ rollbackOnError: true })
             }
 
             if (!options.alter) return;
@@ -112,20 +114,23 @@ namespace AccessControl {
     };
     interface AttributeBaseSyncOptions {
         alter?: boolean;
-        transaction?: Db.Transaction;
+        transaction?: Pool.Transaction;
     }
     export class AttributeBase {
+        private db: Db.Db;
         private model;
         private attributesHandlers: Record<string, Record<string, (req: ERequest) => Promise<boolean>>>;
 
-        constructor(options?: AttributeBaseOptions) {
+        constructor(db: Db.Db, options?: AttributeBaseOptions) {
             options = {
                 tableName: options?.tableName ?? 'abac_table',
             }
 
+            this.db = db;
+
             const tableName = options.tableName!;
 
-            this.model = Db.define(tableName, {
+            this.model = this.db.define(tableName, {
                 abac_id: { type: DataTypes.SERIAL, allowNull: false, primaryKey: true },
                 attribute_name: { type: DataTypes.TEXT, allowNull: false },
                 route: { type: DataTypes.TEXT, allowNull: false },
@@ -148,7 +153,7 @@ namespace AccessControl {
         public async sync(options?: AttributeBaseSyncOptions) {
             options = {
                 alter: options?.alter ?? false,
-                transaction: options?.transaction ?? new Transaction({ rollbackOnError: true })
+                transaction: options?.transaction ?? await this.db.transaction({ rollbackOnError: true })
             }
 
             if (!options.alter) return;

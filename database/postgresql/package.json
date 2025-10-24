@@ -1,6 +1,6 @@
 {
   "name": "@harrypoggers/db-postgresql",
-  "version": "1.0.2",
+  "version": "1.0.5",
   "description": "Db postgresql utility for node js projects",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

@@ -251,7 +251,7 @@ namespace Db {
 
     type ModelBody<T extends Record<string, ColumnOptions<any>>> = Partial<DataValues<T>>;
 
-    interface Model<T extends Record<string, ColumnOptions<any>>> {
+    export interface Model<T extends Record<string, ColumnOptions<any>>> {
         tableName: string;
         schema: string;
         pkColumn: string | null;
@@ -320,6 +320,15 @@ namespace Db {
         }
     }
 
+    function filterBody(body: any) {
+        const filteredBody: { [key: string]: any } = {};
+        for (const [key, val] of Object.entries(body)) {
+            if (val === undefined) continue;
+            filteredBody[key] = val;
+        }
+        return filteredBody;
+    }
+
     interface SyncOptions {
         alter?: boolean;
         onSuccessAlter?: (transaction: Pool.Transaction) => Promise<void>
@@ -378,6 +387,7 @@ namespace Db {
                 pkColumn,
                 async create(body: ModelBody<T>, options?: ModelOptions<T>): Promise<DataValues<T> | null> {
                     return await modelHandler(async () => {
+                        body = filterBody(body) as ModelBody<T>;
                         const keys = Object.keys(body);
                         const values = Object.values(body);
                         const placeholder = new Placeholder();
@@ -407,6 +417,7 @@ namespace Db {
                     });
                 },
                 async update(bodyToUpdate: ModelBody<T>, options?: ModelOptions<T>): Promise<Array<DataValues<T>> | null> {
+                    bodyToUpdate = filterBody(bodyToUpdate) as ModelBody<T>;
                     return await modelHandler(async () => {
                         const placeholder = new Placeholder();
                         const set = `SET ${placeholder.generate(bodyToUpdate)}`;
@@ -468,6 +479,7 @@ namespace Db {
                         };
                         (options.where as any)[pkColumn] = pk;
 
+                        bodyToUpdate = filterBody(bodyToUpdate) as ModelBody<T>;
                         const placeholder = new Placeholder();
                         const set = ` SET ${placeholder.generate(bodyToUpdate)}`;
                         const where = ` WHERE ${placeholder.generate(options.where!, ' AND ')}`;
